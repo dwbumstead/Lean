@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Linq;
 using QuantConnect.Orders;
 
 namespace QuantConnect.Securities
@@ -82,26 +83,67 @@ namespace QuantConnect.Securities
         /// <returns>The margin available for the trade</returns>
         public decimal GetMarginRemaining(SecurityPortfolioManager portfolio, Security security, OrderDirection direction)
         {
+            var baseCurrency = security as IBaseCurrencySymbol;
+            var openOrdersTotalValue = 0m;
+            var openOrdersTotalQuantity = 0m;
+
+            // sum value of open orders in same direction
+            foreach (var order in portfolio.Transactions.GetOpenOrders().Where(x => x.Direction == direction))
+            {
+                var orderSecurity = portfolio.Securities[order.Symbol];
+                var orderValue = order.GetValue(orderSecurity);
+                var orderBaseCurrency = orderSecurity as IBaseCurrencySymbol;
+
+                if (baseCurrency != null && orderBaseCurrency != null)
+                {
+                    // for currency swaps, we only count orders for the same base or quote currency,
+                    // depending on order direction
+                    if (direction == OrderDirection.Buy && order.PriceCurrency == security.QuoteCurrency.Symbol ||
+                        direction == OrderDirection.Sell && orderBaseCurrency.BaseCurrencySymbol == baseCurrency.BaseCurrencySymbol)
+                    {
+                        var orderPrice = 0m;
+                        switch (order.Type)
+                        {
+                            case OrderType.Limit:
+                                orderPrice = ((LimitOrder)order).LimitPrice;
+                                break;
+                            case OrderType.StopMarket:
+                                orderPrice = ((StopMarketOrder)order).StopPrice;
+                                break;
+                            case OrderType.StopLimit:
+                                orderPrice = ((StopLimitOrder)order).LimitPrice;
+                                break;
+                        }
+                        openOrdersTotalValue += orderPrice * order.Quantity;
+                        openOrdersTotalQuantity += order.Quantity;
+                    }
+                }
+                else
+                {
+                    openOrdersTotalValue += orderValue;
+                    openOrdersTotalQuantity += order.Quantity;
+                }
+            }
+
             switch (direction)
             {
                 case OrderDirection.Hold:
                 case OrderDirection.Buy:
                     // increasing position, purchasing in units of the quote currency
-                    return security.QuoteCurrency.Amount;
+                    return security.QuoteCurrency.Amount - openOrdersTotalValue;
 
                 case OrderDirection.Sell:
                     // remaining margin in units of the base currency ( can't sell what we don't have )
-                    var baseCurrency = security as IBaseCurrencySymbol;
                     if (baseCurrency != null)
                     {
                         // we have this much 'cash' that can be sold
-                        return _cashBook[baseCurrency.BaseCurrencySymbol].Amount;
+                        return _cashBook[baseCurrency.BaseCurrencySymbol].Amount - Math.Abs(openOrdersTotalQuantity);
                     }
 
                     // we have this much stock value that can be sold... this is in the account currency,
                     // the assumption being that since the security doesn't implement IBaseCurrencySymbol
                     // that the holdings are either 'units' of stock or similar and not currency swaps/virtual positions
-                    return security.Holdings.AbsoluteHoldingsValue;
+                    return (security.Holdings.AbsoluteQuantity - Math.Abs(openOrdersTotalQuantity)) * security.Holdings.AveragePrice;
 
                 default:
                     throw new ArgumentOutOfRangeException(nameof(direction), direction, null);
